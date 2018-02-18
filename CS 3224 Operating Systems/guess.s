@@ -135,7 +135,17 @@ _printNewLine:
 _retToCaller:
     ret 
 
+# User can restart by pressing "R"
 _done:
+    movw $_restart, %si
+    call _printString
+    call _printNewLine
+    # read user input ====================
+    movb $0x00, %ah # sets up to read from keyboard
+    int $0x16 # calls BIOS to read from keyboard and puts char in %al
+    cmp $0x52, %al
+    call _getRandomNumber
+    jz _gameLoop
     jmp _done
 
 # data / content:
@@ -150,6 +160,9 @@ _endGameMsg:
 
 _userPromptMsg:
     .string "What number am I thinking of (0-9)? "
+
+_restart:
+    .string "Press R to restart"
 
 .fill 510 - (. - start), 1, 0
 # the magic bytes in the end
