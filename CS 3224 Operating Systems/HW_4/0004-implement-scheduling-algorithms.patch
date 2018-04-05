@@ -1,0 +1,77 @@
+From 9f64b97d383659ff7cfbe817667d0d7a768efab5 Mon Sep 17 00:00:00 2001
+From: David Zheng <dz1063@nyu.edu>
+Date: Fri, 30 Mar 2018 16:03:26 -0400
+Subject: [PATCH 4/4] implement scheduling algorithms
+
+---
+ sanity.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/sanity.c b/sanity.c
+index 5099985..c25524b 100644
+--- a/sanity.c
++++ b/sanity.c
+@@ -11,8 +11,9 @@ int main(int argc, char* argv[])
+ 
+     // Note: turnAround = time of completion - time of submitions
+ 
+-    uint i;
+-    for(i = 0; i< 64; ++i)
++    uint i,numChildren;
++    numChildren = 20;
++    for(i = 0; i< numChildren; ++i)
+     {
+         // fork between parent (original) and child (new)
+         if((pid =fork()) == 0) break;
+@@ -31,17 +32,19 @@ int main(int argc, char* argv[])
+         // we must added the stats of the children when they come back
+         // parent must validate a child's exit status with its pid (store in pidArry)
+         uint i;
+-        for(i = 0; i < 64; ++i)
++        for(i = 0; i < numChildren; ++i)
+         {
+ 
+             //////printf(1,"%d -> pid: %d\n", i, pidArray[i]);
+             //printf(1,"address of wtime: %d\n",&wtime[i]);
+             wait_stat(&wtime[i],&rutime[i],&iotime[i],&status[i]);
+             ///printf(1,"w:%d r:%d io:%d status:%d\n",wtime[i],rutime[i],iotime[i],status[i]);
+-            // validate the exit staus
++
++            // validate the exit status
+             if(pidArray[i] == status[i])
+             {
+                 // if valid, then we shall perform stat calculations
++                // and print out stats for child
+                 waitTotal += wtime[i];
+                 runTotal += rutime[i];
+                 ioTotal += iotime[i];
+@@ -54,20 +57,24 @@ int main(int argc, char* argv[])
+             printf(1,"\n\n");
+         }
+         
+-        // print out average stats
++        // print out average stats across all children
+         printf(1,"  Overall Stats  \nWait Time Avg: %d\nRun Time Avg: %d\nIO Time Avg: %d\nTurnaround Time Avg: %d\n\n"
+-                ,waitTotal/64,runTotal/64,ioTotal/64,turnAroundTotal/64);
++                ,waitTotal/numChildren,runTotal/numChildren,ioTotal/numChildren,turnAroundTotal/numChildren);
+      
+         
+         exit();
+ 
+     }
++    // child process
+     else if(pid == 0)
+     {
++        /*
+         if(i > 1 || i < 63)
+         {
+             sleep(20);
+         }
++        */
++       
+         // Do some useless calcualtions (more than 30 clock ticks)
+         uint i, sum;
+         for(i = 0; i< 5000000;++i)
+-- 
+2.16.2
+

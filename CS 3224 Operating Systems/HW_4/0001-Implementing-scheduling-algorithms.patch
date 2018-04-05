@@ -1,0 +1,643 @@
+From a61f044d31a5f3ffbe4bbc9ba4ebea5e30fa80be Mon Sep 17 00:00:00 2001
+From: David Zheng <dz1063@nyu.edu>
+Date: Sat, 24 Mar 2018 19:57:27 -0400
+Subject: [PATCH 1/4] Implementing scheduling algorithms
+
+---
+ Makefile  |   5 ++
+ defs.h    |   6 ++
+ param.h   |   2 +
+ proc.c    | 296 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ proc.h    |   9 ++
+ syscall.c |   3 +
+ syscall.h |   3 +
+ sysproc.c |  18 ++++
+ trap.c    |  33 ++++++-
+ user.h    |   2 +
+ usys.S    |   1 +
+ 11 files changed, 371 insertions(+), 7 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index b4fd9a2..2d03df2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -81,6 +81,10 @@ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+ LDFLAGS += -m $(shell $(LD) -V | grep elf_i386 2>/dev/null)
+ 
++#Scheduler Flags
++SCHEDFLAG = DEFAULT
++CFLAGS += -D $(SCHEDFLAG)
++
+ xv6.img: bootblock kernel fs.img
+ 	dd if=/dev/zero of=xv6.img count=10000
+ 	dd if=bootblock of=xv6.img conv=notrunc
+@@ -172,6 +176,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_sanity\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index b47372b..ce17676 100644
+--- a/defs.h
++++ b/defs.h
+@@ -118,6 +118,12 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++// added sys call (these are function prototypes
++int             wait_stat(int*,int*,int*,int*);
++void            incrementTimers(void);
++void            schedulerDefault(void) __attribute__((noreturn));
++void            schedulerFIFO(void) __attribute__((noreturn));
++void            schedulerFCFS(void) __attribute__((noreturn));
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/param.h b/param.h
+index a7e90ef..6eb487f 100644
+--- a/param.h
++++ b/param.h
+@@ -12,3 +12,5 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ 
++// David
++#define QUANTA       5 // quanta per process (in clock ticks)
+diff --git a/proc.c b/proc.c
+index fee4e95..344af81 100644
+--- a/proc.c
++++ b/proc.c
+@@ -7,6 +7,49 @@
+ #include "proc.h"
+ #include "spinlock.h"
+ 
++// David
++struct processQueue{
++  // There can only be NPROC processes defined by xv6
++  // aka max limit of processes 
++  struct proc* queue[NPROC]; // holds an array of address to processes
++  uint numElements; // keeps track of number of elements in queue
++};
++
++// puts processes int the queue
++int enqueue(struct processQueue* PQ, struct proc* element)
++{
++  // Should never happen
++  if(PQ->numElements >= NPROC) return -1;
++
++  // element is the address to the process
++  PQ->queue[PQ->numElements] = element;
++  PQ->numElements++;
++  return 0;
++}
++
++struct proc* dequeue(struct processQueue* PQ)
++{
++  // no more elements = no initprocess
++  if(PQ->numElements <= 0)
++  {
++    panic("No more processes");
++    return 0;
++  }
++  struct proc* result;
++  result = PQ->queue[0]; // pick the head of the queue
++  // shift elements in queue down
++  uint i;
++  for(i = 0; i < PQ->numElements-1;++i)
++  {
++    PQ->queue[i] = PQ->queue[i+1];
++  }
++  PQ->numElements--;
++  return result; 
++}
++
++struct processQueue PQ;
++
++// =========
+ struct {
+   struct spinlock lock;
+   struct proc proc[NPROC];
+@@ -100,6 +143,11 @@ userinit(void)
+   p->cwd = namei("/");
+ 
+   p->state = RUNNABLE;
++
++  // put init process into our queue of runnable processes
++  #if defined(FRR) || defined(FCFS)
++    enqueue(&PQ,p);
++  #endif
+ }
+ 
+ // Grow current process's memory by n bytes.
+@@ -141,7 +189,15 @@ fork(void)
+     np->kstack = 0;
+     np->state = UNUSED;
+     return -1;
+-  }
++  } 
++  // David 
++  // New process. all times are set to 0, creation time = current clock tick
++  np->ctime = ticks;
++  np->stime = 0;
++  np->rutime = 0;
++  np->retime = 0;
++  np->ttime = 0;
++
+   np->sz = proc->sz;
+   np->parent = proc;
+   *np->tf = *proc->tf;
+@@ -161,6 +217,11 @@ fork(void)
+   // lock to force the compiler to emit the np->state write last.
+   acquire(&ptable.lock);
+   np->state = RUNNABLE;
++
++  //add new process into our queue
++  #if defined(FRR) || defined(FCFS)
++    enqueue(&PQ,np);
++  #endif
+   release(&ptable.lock);
+   
+   return pid;
+@@ -194,12 +255,14 @@ exit(void)
+   acquire(&ptable.lock);
+ 
+   // Parent might be sleeping in wait().
+-  wakeup1(proc->parent);
++  wakeup1(proc->parent); // Note: parent process doesn't run right away. It's simply runnable
+ 
++  // from the perspective of a child, itself could have children
+   // Pass abandoned children to init.
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    // looking for childs of current process
+     if(p->parent == proc){
+-      p->parent = initproc;
++      p->parent = initproc; // init inherits
+       if(p->state == ZOMBIE)
+         wakeup1(initproc);
+     }
+@@ -207,10 +270,67 @@ exit(void)
+ 
+   // Jump into the scheduler, never to return.
+   proc->state = ZOMBIE;
++  // David
++  // all exited processes seem to become a zombie state regardlessly when they exit
++  // Possible reasons?
++  // 1.) If we are the child, then we are a zombie if parent isn't waiting
++  // 2.) If wakeup1(), doesn't wake the parent, then we are clearly a zombie
++  proc->ttime = ticks;   // mark termination time 
+   sched();
+   panic("zombie exit");
+ }
+ 
++int wait_stat(int* wtime, int* rtime, int* iotime, int* status)
++{
++  struct proc *p;
++  int havekids, pid;
++
++  acquire(&ptable.lock);
++  for(;;){
++    // Scan through table looking for zombie children.
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->parent != proc)
++        continue;
++      havekids = 1;
++      // kills / clean up our children
++      if(p->state == ZOMBIE){
++        // Found one.
++        pid = p->pid;
++        // stats of the terminated process
++        *wtime = p->retime;
++        //cprintf("wait_sta(): wtime: %d %d", *wtime,p->retime);
++        *rtime = p->rutime;
++        //cprintf("wait_stat(): addrWtime: %d pid %d wtime: %d proc->retime: %d \n ",wtime,pid,*wtime, p->rutime);
++        *iotime = p->stime;
++        *status = pid; // pid of child
++
++        kfree(p->kstack);
++        p->kstack = 0;
++        freevm(p->pgdir);
++        p->state = UNUSED;
++        p->pid = 0;
++        p->parent = 0;
++        p->name[0] = 0;
++        p->killed = 0;
++        
++        release(&ptable.lock);
++        return pid;
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || proc->killed){
++      release(&ptable.lock);
++      *status = -1; // can't return pid of child if don't have.
++      return -1;
++    }
++
++    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++    sleep(proc, &ptable.lock);  //DOC: wait-sleep
++  }
++  
++}
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+ int
+@@ -254,6 +374,33 @@ wait(void)
+   }
+ }
+ 
++// David
++// increments the corresponding timer for all processes (per tick)
++// according to their current state
++// minics the structure of the schedulr
++void incrementTimers(void)
++{
++  struct proc* p; //ptable is basically an array of processes
++  acquire(&ptable.lock);
++  // the for loops seems to be like a iterator certain aspects
++  // p is an address to first entry, &ptable.proc[NPROC] is address of the last process table entry
++  // since the first entry would be at a lower address than the last entry (GCC convention)
++  // better than using integer index to go through the array
++  // since you need to access the process properties anyways
++  // Modifed content of for loop from xv6 scheduler()
++
++  // Goes through whole process table to update timer stats
++  // at every clock tick
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++  {
++    if(p->state == SLEEPING) p->stime++;
++    else if(p->state == RUNNING) p->rutime++;
++    else if(p->state == RUNNABLE) p->retime++;
++
++
++  }
++  release(&ptable.lock);
++}
+ //PAGEBREAK: 42
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+@@ -265,9 +412,25 @@ wait(void)
+ void
+ scheduler(void)
+ {
++  #ifdef DEFAULT
++    schedulerDefault();
++  #endif
++  #ifdef FRR
++    //cprintf("FRR selected\n");
++    schedulerFIFO();
++  #endif
++  #ifdef FCFS
++    //cprintf("FCFS selected\n");
++    schedulerFCFS();
++  #endif
++}
++
++// policy with quanta
++void schedulerDefault(void)
++{
++  cprintf("DEFAULT Scheduler selected\n");
+   struct proc *p;
+   int foundproc = 1;
+-
+   for(;;){
+     // Enable interrupts on this processor.
+     sti();
+@@ -287,11 +450,19 @@ scheduler(void)
+       // before jumping back to us.
+       foundproc = 1;
+       proc = p;
++      //cprintf("found runnable: %d\n",proc->pid);
++      // we have selected this process, now mark the time it started
++      proc->startTime = ticks;
++      //cprintf("proc PID: %d proc Start: %d \n",proc->pid, proc->startTime);
++      // we will keep current process running until it reached its quanta
++      // p and proc should represent the same process at this point
++      // the trap() will yield the process when its quanta is up
+       switchuvm(p);
+       p->state = RUNNING;
+       swtch(&cpu->scheduler, proc->context);
+       switchkvm();
+-
++      //cprintf("proc PID: %d proc End: %d \n",proc->pid,ticks);
++      //cprintf("scheduler(): pid:%d wtime: %d runtime: %d\n",proc->pid,proc->retime,proc->rutime);
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       proc = 0;
+@@ -301,6 +472,109 @@ scheduler(void)
+   }
+ }
+ 
++// First In First Out Round Robin (FIFO with Quanta)
++void schedulerFIFO(void)
++{
++  cprintf("FRR Scheduler selected\n");
++  struct proc *p;
++  int foundproc = 1;
++  
++  for(;;){
++    // Enable interrupts on this processor.
++    sti();
++
++    if (!foundproc) hlt();
++
++    foundproc = 0;
++
++    // Loop over process table looking for process to run.
++    acquire(&ptable.lock);
++    // Note: PQ is a queue with runnable processes
++    // if nothing is runnable, then just loop
++    if(PQ.numElements ==0)
++    {
++      release(&ptable.lock);
++      continue;
++    }
++      // Switch to chosen process.  It is the process's job
++      // to release ptable.lock and then reacquire it
++    // before jumping back to us.
++    foundproc = 1;
++    proc = dequeue(&PQ);
++    p = proc;
++    // we have selected this process, now mark the time it started
++    proc->startTime = ticks;
++    //cprintf("I picked PID: %d \n",proc->pid);
++
++    // we will keep current process running until it reached its quanta
++    // p and proc should represent the same process at this point
++
++    switchuvm(p);
++    p->state = RUNNING;
++    swtch(&cpu->scheduler, proc->context);
++    switchkvm();
++    //cprintf("PID AFTER:%d\n", proc->pid);
++    // Shove back of queue if runnable
++    if(proc->state == RUNNABLE) enqueue(&PQ,proc);
++
++    // Process is done running for now.
++    // It should have changed its p->state before coming back.
++    proc = 0;
++    release(&ptable.lock);
++
++  }
++}
++
++//First Come First Serve (NON-PREMPTIVE)
++void schedulerFCFS(void)
++{
++  cprintf("FCFS Scheduler selected\n");
++  struct proc *p;
++  int foundproc = 1;
++
++  for(;;){
++    // Enable interrupts on this processor.
++    sti();
++
++    if (!foundproc) hlt();
++
++    foundproc = 0;
++
++    // Loop over process table looking for process to run.
++    acquire(&ptable.lock);
++    // Note: PQ is a queue with runnable processes
++    // if nothing is runnable, then just loop
++    if(PQ.numElements ==0)
++    {
++      release(&ptable.lock);
++      continue;
++    }
++      // Switch to chosen process.  It is the process's job
++      // to release ptable.lock and then reacquire it
++    // before jumping back to us.
++    foundproc = 1;
++    proc = dequeue(&PQ);
++    p = proc;
++
++    //cprintf("I picked: pid %d\n",p->pid);
++    // we will keep current process running until it reached its quanta
++    // p and proc should represent the same process at this points
++
++    switchuvm(p);
++    p->state = RUNNING;
++    swtch(&cpu->scheduler, proc->context);
++    switchkvm();
++
++    // Shove back of queue if runnable
++    if(proc->state == RUNNABLE) enqueue(&PQ,proc);
++
++    // Process is done running for now.
++    // It should have changed its p->state before coming back.
++    proc = 0;
++    release(&ptable.lock);
++
++  }
++}
+ // Enter scheduler.  Must hold only ptable.lock
+ // and have changed proc->state.
+ void
+@@ -399,7 +673,13 @@ wakeup1(void *chan)
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+     if(p->state == SLEEPING && p->chan == chan)
++    {
+       p->state = RUNNABLE;
++      #if defined(FRR) || defined(FCFS)
++        enqueue(&PQ,p);
++      #endif
++    }
++
+ }
+ 
+ // Wake up all processes sleeping on chan.
+@@ -425,7 +705,12 @@ kill(int pid)
+       p->killed = 1;
+       // Wake process from sleep if necessary.
+       if(p->state == SLEEPING)
++      {
+         p->state = RUNNABLE;
++        #if defined(FRR) || defined(FCFS)
++          enqueue(&PQ,p);
++        #endif
++      }
+       release(&ptable.lock);
+       return 0;
+     }
+@@ -470,3 +755,4 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
+diff --git a/proc.h b/proc.h
+index 3b9c3ac..9973641 100644
+--- a/proc.h
++++ b/proc.h
+@@ -66,6 +66,15 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // time stats == David
++  uint ctime; // creation time
++  uint ttime; // termination time
++  uint stime; // sleep time
++  uint retime; // ready time
++  uint rutime; // runnning time
++
++  uint startTime; // time when process starts running (used for scheduling)
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/syscall.c b/syscall.c
+index 799ebc2..968d4a6 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -98,6 +98,8 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++// new sys call
++extern int sys_wait_stat(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -121,6 +123,7 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_wait_stat]sys_wait_stat, // new sys call for wait_stat();
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..d980684 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++
++// David
++#define SYS_wait_stat 22
+diff --git a/sysproc.c b/sysproc.c
+index 027a5e5..a0b9515 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -7,6 +7,24 @@
+ #include "mmu.h"
+ #include "proc.h"
+ 
++// new sys call
++int sys_wait_stat(void)
++{
++  // grab arguments to be used in wait_stat()
++  int* wtime,*rtime,*iotime,*status;
++  // argptr takes gets a pointer and puts it into our variable
++  // casting of char** is needed since argptr expects char**
++  // our casting is fine since we know the true nature of the arguments that it will get
++  // which are int*. in reality it would be int**
++  if(argptr(0,(char**) &wtime, sizeof(wtime)) == -1) return -1;
++  if(argptr(1,(char**) &rtime, sizeof(rtime)) == -1) return -1;
++  if(argptr(2,(char**) &iotime, sizeof(iotime)) == -1) return -1;
++  if(argptr(3,(char**) &status, sizeof(status)) == -1) return -1;
++  //cprintf("wtime: %d\n",wtime);
++
++  // calls wait_stat defined in proc.c
++  return wait_stat(wtime,rtime,iotime,status);
++}
+ int
+ sys_fork(void)
+ {
+diff --git a/trap.c b/trap.c
+index 3f80145..5e44c43 100644
+--- a/trap.c
++++ b/trap.c
+@@ -32,6 +32,7 @@ idtinit(void)
+   lidt(idt, sizeof(idt));
+ }
+ 
++
+ //PAGEBREAK: 41
+ void
+ trap(struct trapframe *tf)
+@@ -47,10 +48,16 @@ trap(struct trapframe *tf)
+   }
+ 
+   switch(tf->trapno){
++    // handles timer interrupts from (clock)
++    // Should increment timer here, regardless of state
+   case T_IRQ0 + IRQ_TIMER:
+     if(cpu->id == 0){
+       acquire(&tickslock);
+       ticks++;
++      // need something to go through all processes
++      // update each time based on states
++      // goes through process table to increment each process' timer
++      incrementTimers(); 
+       wakeup(&ticks);
+       release(&tickslock);
+     }
+@@ -100,10 +107,32 @@ trap(struct trapframe *tf)
+   if(proc && proc->killed && (tf->cs&3) == DPL_USER)
+     exit();
+ 
+-  // Force process to give up CPU on clock tick.
++  // Scheduler conditionals
++  #ifdef FCFS
++  // No check is needed for FCFS
++  // Since FCFS is non-premptive, a new process is selected to run
++  // when the current process (proc) has either yield, finished, or sleeping/blocked
++  // Case 1: If process calls yield(), then we go back to sched()
++  // Case 2: If process is finished, trap() will exit() which later goes into sched()
++  //          exit() is called by the if statement above
++  // Case 3: if process is sleeping, then the sleep() would call sched() <- as defined in sleep()
++  #endif
++
++  #if defined(DEFAULT)|| defined(FRR)
++  // Force process to give up CPU when process used up its QUANTA (David)
+   // If interrupts were on while locks held, would need to check nlock.
+-  if(proc && proc->state == RUNNING && tf->trapno == T_IRQ0+IRQ_TIMER)
++  // Both DEFAULT and FRR utilize the QUANTA
++  // This would check if the proc has used up its time slice at every clock timer interval
++  // proc->startTime marks the time the scheduler() selected the process to run
++  // If the current tick is greater than startTime+QUANTA then the process' quanta is used up
++  if(proc && proc->state == RUNNING && tf->trapno == T_IRQ0+IRQ_TIMER && ticks >= proc->startTime+QUANTA)
++  {
++    //cprintf("proc: %d has stopped running ticks: %d start: %d\n",proc->pid, ticks, proc->startTime);
++    //cprintf("ticks at trap(): %d\n",ticks);
+     yield();
++    
++  }
++  #endif
+ 
+   // Check if the process has been killed since we yielded
+   if(proc && proc->killed && (tf->cs&3) == DPL_USER)
+diff --git a/user.h b/user.h
+index f45b8d5..ee9f3d2 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++// added sys calls
++int wait_stat(int*,int*,int*,int*);
+ 
+ // ulib.c
+ int stat(char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..6f57eba 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(wait_stat)
+-- 
+2.16.2
+

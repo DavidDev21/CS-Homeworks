@@ -1,0 +1,77 @@
+From 2da900e23e53fa3fdb14db56651df4533369dabf Mon Sep 17 00:00:00 2001
+From: David Zheng <dz1063@nyu.edu>
+Date: Fri, 30 Mar 2018 15:29:19 -0400
+Subject: [PATCH 3/4] Implement scheduling algorithms
+
+---
+ Makefile | 11 ++++++++++-
+ sanity.c | 10 +++++++---
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 2d03df2..ee13dc2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -83,7 +83,16 @@ LDFLAGS += -m $(shell $(LD) -V | grep elf_i386 2>/dev/null)
+ 
+ #Scheduler Flags
+ SCHEDFLAG = DEFAULT
+-CFLAGS += -D $(SCHEDFLAG)
++ifeq ($(SCHEDFLAG),DEFAULT)
++	CFLAGS += -D $(SCHEDFLAG)
++else ifeq ($(SCHEDFLAG),FRR)
++	CFLAGS += -D $(SCHEDFLAG)
++else ifeq ($(SCHEDFLAG),FCFS)
++	CFLAGS += -D $(SCHEDFLAG)	
++else
++    $(error NOT A VALID SCHEDULER FLAG: $(SCHEDFLAG); Only: DEFAULT, FRR, FCFS are valid)
++endif
++
+ 
+ xv6.img: bootblock kernel fs.img
+ 	dd if=/dev/zero of=xv6.img count=10000
+diff --git a/sanity.c b/sanity.c
+index c8c6dc4..5099985 100644
+--- a/sanity.c
++++ b/sanity.c
+@@ -12,7 +12,7 @@ int main(int argc, char* argv[])
+     // Note: turnAround = time of completion - time of submitions
+ 
+     uint i;
+-    for(i = 0; i< 20; ++i)
++    for(i = 0; i< 64; ++i)
+     {
+         // fork between parent (original) and child (new)
+         if((pid =fork()) == 0) break;
+@@ -31,7 +31,7 @@ int main(int argc, char* argv[])
+         // we must added the stats of the children when they come back
+         // parent must validate a child's exit status with its pid (store in pidArry)
+         uint i;
+-        for(i = 0; i < 20; ++i)
++        for(i = 0; i < 64; ++i)
+         {
+ 
+             //////printf(1,"%d -> pid: %d\n", i, pidArray[i]);
+@@ -56,7 +56,7 @@ int main(int argc, char* argv[])
+         
+         // print out average stats
+         printf(1,"  Overall Stats  \nWait Time Avg: %d\nRun Time Avg: %d\nIO Time Avg: %d\nTurnaround Time Avg: %d\n\n"
+-                ,waitTotal/20,runTotal/20,ioTotal/20,turnAroundTotal/20);
++                ,waitTotal/64,runTotal/64,ioTotal/64,turnAroundTotal/64);
+      
+         
+         exit();
+@@ -64,6 +64,10 @@ int main(int argc, char* argv[])
+     }
+     else if(pid == 0)
+     {
++        if(i > 1 || i < 63)
++        {
++            sleep(20);
++        }
+         // Do some useless calcualtions (more than 30 clock ticks)
+         uint i, sum;
+         for(i = 0; i< 5000000;++i)
+-- 
+2.16.2
+
